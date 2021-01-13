@@ -1,0 +1,5 @@
+privkey.pem
+tls/generateTLS/keys/*
+deploymentConfig_dev.json
+connections/*.pem
+connections/*.txt

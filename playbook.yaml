@@ -1,0 +1,208 @@
+# Create certificate authority and client certificate
+- name: a play that runs entirely on the ansible host
+  hosts: 127.0.0.1
+  connection: local
+  tasks:
+    # generate keys - modify tls/genCA.sh if you don't need a new CA
+    # - name: create ca pem file
+    #   shell: ./tls/generateTLS/genCA.sh
+    - name: create client pem file
+      shell: ./tls/generateTLS/genClient.sh
+    - name: client cert to connections directory
+      copy:
+        src: ./tls/generateTLS/keys/out/client.pem
+        dest: ./connections/client.pem
+        mode: '0644'
+    - name: Copy CA file to connections directory
+      copy:
+        src: ./tls/generateTLS/keys/ca.pem
+        dest: ./connections/ca.pem
+        mode: '0644'
+
+
+# Launch EC2 Instances
+- name: Ansible test
+  hosts: localhost
+  tasks:
+    - name: launching AWS instance using Ansible
+      ec2:
+        profile: matt
+        instance_type: t2.micro
+        image: ami-07efac79022b86107
+        wait: yes
+        count: 3 
+        assign_public_ip: yes
+        vpc_subnet_id: subnet-53f0df19
+        region: us-east-2
+        key_name: mdg_key
+        volumes:
+          - device_name: /dev/xvdb
+            volume_type: gp2
+            volume_size: 10
+            delete_on_termination: true
+        instance_tags:
+          Name: mg_ansible_test
+          owner: matthew.grogan
+          expire-on: "2020-10-30"
+          purpose: "training"
+      register: ec2
+    - debug:
+        msg: "Instance {{ ec2 }} launched"
+    - name: Add new instance to host group
+      add_host:
+        hostname: "{{ item.dns_name }}"
+        dns_name_pub: "{{ item.dns_name }}"
+        groupname: launched
+      with_items: "{{ ec2.instances }}"
+    - name: generate certificates
+      shell: "./tls/generateTLS/genServerKey.sh {{ item.dns_name }}"
+      with_items: "{{ ec2.instances }}"
+    - name: Wait for SSH to come up
+      wait_for:
+        host: "{{ item.public_dns_name }}"
+        port: 22
+        delay: 60
+        timeout: 320
+        state: started
+      with_items: "{{ ec2.instances }}"
+
+#Set up instances with Cloud Manager
+- hosts: launched
+  remote_user: ubuntu
+  become: yes
+  vars_files:
+    - deploymentConfig.json
+  tasks:
+    - debug:
+        msg: "Hostnames: {{ dns_name_pub }}"
+    - name: Install MongoDB Enterprise dependencies
+      apt:
+        pkg: 
+          - libcurl4
+          - libgssapi-krb5-2
+          - libkrb5-dbg
+          - libldap-2.4-2
+          - libpci3
+          - libsasl2-2
+          - snmp
+          - openssl
+        update_cache: yes
+    - name: Disable THP - copy service file
+      copy:
+        src: thp.service
+        dest: /lib/systemd/system/thp.service
+        owner: root
+        group: root
+        mode: '0644'
+    - name: Disable THP - reload daemon
+      systemd:
+        state: restarted
+        daemon_reload: yes
+        name: thp
+        enabled: yes
+    # - name: Set ulimit - copy service file
+    #   copy:
+    #     src: thp.service
+    #     dest: /lib/systemd/system/mdbulimit.service
+    #     owner: root
+    #     group: root
+    #     mode: '0644'
+    # - name: Set ulimit - reload daemon
+    #   systemd:
+    #     state: restarted
+    #     daemon_reload: yes
+    #     name: mdbulimit
+    #     enabled: yes
+    - name: Install agent from cloud manager.
+      apt:
+        deb: "{{ rootURL }}/download/agent/automation/mongodb-mms-automation-agent-manager_10.20.1.6618-1_amd64.ubuntu1604.deb"
+    - name: Write mongo config files
+      template:
+        src: automation-agent.j2
+        dest: /etc/mongodb-mms/automation-agent.config
+        mode: '0644'
+    - name: Create data directory
+      file:
+        path: /data
+        state: directory
+    - name: Create a new primary partition
+      parted:
+        device: /dev/xvdb
+        number: 1
+        flags: [ lvm ]
+        state: present
+    - name: Create volume group for MongoDB data volume
+      lvg:
+        vg: mdb-vg
+        pvs: /dev/xvdb1
+        state: present
+    - name: Create logical volume for MongoDB data volume
+      lvol:
+        vg: mdb-vg
+        lv: mdb-lv
+        state: present
+        shrink: no
+        size: 8G
+    - name: Create xfs filesystem
+      filesystem:
+        fstype: xfs
+        dev: /dev/mdb-vg/mdb-lv
+    - name: Mount MongoDB data directory
+      mount:
+        path: /data
+        src: /dev/mdb-vg/mdb-lv
+        fstype: xfs
+        state: mounted
+    - name: Change owner of MongoDB data directory
+      file:
+        path: /data
+        owner: mongodb
+        group: mongodb
+    # generate server certificates and copy certificate files to nodes
+    - name: Copy certs to server
+      copy:
+        src: "./tls/generateTLS/keys/out/{{ dns_name_pub }}-server.pem"
+        dest: /etc/ssl/certs/mdbserver.pem
+        owner: root
+        group: root
+        mode: '0644'
+    - name: Copy client certs to server (for agents)
+      copy:
+        src: ./tls/generateTLS/keys/out/client.pem
+        dest: /etc/ssl/certs/mdbclient.pem
+        owner: root
+        group: root
+        mode: '0644'
+    - name: Copy CA file to server
+      copy:
+        src: ./tls/generateTLS/keys/ca.pem
+        dest: /etc/ssl/certs/mdbserverCA.pem
+        owner: root
+        group: root
+        mode: '0644'
+    # set hostname to AWS public hostname
+    ## TODO: set this up with some proper DNS since public hostname on aws instances can change after reboot! Or just use private dns name... idk...
+    - name: set hostname
+      hostname:
+        name: "{{ dns_name_pub }}"
+    # start agents
+    - name: Start and enable automation agent
+      systemd:
+        state: started
+        name: mongodb-mms-automation-agent
+        enabled: yes
+    - name: Restart automation agent
+      systemd:
+        state: restarted
+        name: mongodb-mms-automation-agent
+    
+      
+#Use cloud mgr api to deploy replica set
+- hosts: localhost
+  connection: local
+  tasks:
+    - name: show all the hosts matching the pattern, i.e. all but the group www
+      debug:
+        msg: "{{ groups['launched'] }}"
+    - name: deploy rep set
+      shell: "./src/deployReplicaSet.py \"{{ groups['launched'] }}\" > connections/connString.txt"
